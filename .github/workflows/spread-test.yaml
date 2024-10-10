@@ -1,10 +1,10 @@
-name: Run a spread test of the generated snap
+name: Tests
 
 on: [pull_request]
 
 jobs:
-  snap-builds:
-    runs-on: ubuntu-22.04
+  snap-build-amd64:
+    runs-on: ubuntu-24.04
     # Only build the snap for pull requests, it's not needed on release branches
     # or on master since we have launchpad build recipes which do this already
     if: ${{ github.event_name == 'pull_request' }}
@@ -18,20 +18,78 @@ jobs:
     - name: Uploading ubuntu-image snap artifact
       uses: actions/upload-artifact@v4
       with:
-        name: snap
+        name: snap-amd64
         path: "*.snap"
+        if-no-files-found: error
 
+  snap-build-arm64:
+    runs-on: [self-hosted, ARM64, noble, Linux]
+    # Only build the snap for pull requests, it's not needed on release branches
+    # or on master since we have launchpad build recipes which do this already
+    if: ${{ github.event_name == 'pull_request' }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Build ubuntu-image snap
+      uses: snapcore/action-build@v1
+
+    - name: Uploading ubuntu-image snap artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: snap-arm64
+        path: "*.snap"
+        if-no-files-found: error
+        
   spread:
+    name: Build a ${{ matrix.series }} image on ${{ matrix.group }} (${{ matrix.systems }})
     runs-on: [self-hosted, ubuntu-image]
-    needs: snap-builds
+    needs: [snap-build-amd64, snap-build-arm64]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - group: ubuntu-arm
-            systems: 'ubuntu-20.04-arm-64 ubuntu-22.04-arm-64 ubuntu-24.04-arm-64'
-          - group: ubuntu
-            systems: 'ubuntu-18.04-64 ubuntu-20.04-64 ubuntu-22.04-64 ubuntu-23.10-64 ubuntu-24.04-64'
+          - group: ubuntu-devel
+            series: oracular
+            arch: amd64
+            systems: 'ubuntu-24.04-64'
+            tests: 'tests/commons/... tests/amd64/...'
+          - group: ubuntu-devel-crossbuild
+            series: oracular
+            arch: amd64
+            systems: 'ubuntu-24.04-64'
+            tests: 'tests/amd64-crossbuild/...'
+          - group: ubuntu-latest
+            series: noble
+            arch: amd64
+            systems: 'ubuntu-24.04-64'
+            tests: 'tests/amd64/...'
+          - group: ubuntu-latest-crossbuild
+            series: noble
+            arch: amd64
+            systems: 'ubuntu-24.04-64'
+            tests: 'tests/amd64-crossbuild/...'
+          - group: ubuntu-old
+            series: noble
+            arch: amd64
+            systems: 'ubuntu-20.04-64 ubuntu-22.04-64'
+            tests: 'tests/commons/... tests/amd64/...'
+          - group: ubuntu-arm-devel
+            series: oracular
+            arch: arm64
+            systems: 'ubuntu-24.04-arm-64'
+            tests: 'tests/commons/... tests/arm64/...'
+          - group: ubuntu-arm-latest
+            series: noble
+            arch: arm64
+            systems: 'ubuntu-24.04-arm-64'
+            tests: 'tests/arm64/...'
+          - group: ubuntu-arm-old
+            series: noble
+            arch: arm64
+            systems: 'ubuntu-20.04-arm-64 ubuntu-22.04-arm-64'
+            tests: 'tests/commons/... tests/arm64/...'
+
     steps:
       - name: Cleanup job workspace
         id: cleanup-job-workspace
@@ -56,10 +114,11 @@ jobs:
           key: "${{ github.job }}-results-${{ github.run_id }}-${{ matrix.group }}-${{ steps.get-previous-attempt.outputs.previous_attempt }}"
 
       # Needed for some older series we are unable to build the snap on anymore 
-      - name: Download previsouly build artifact
+      - name: Download previously built artifacts
         uses: actions/download-artifact@v4
         with:
-          name: snap
+          pattern: snap-${{ matrix.arch }}
+          merge-multiple: true
 
       - name: Prepare test results env and vars
         id: prepare-test-results-env
@@ -96,11 +155,12 @@ jobs:
             echo "::add-matcher::.github/spread-problem-matcher.json"
   
             BACKEND=google
-            SPREAD=spread
+            SERIES=${{ matrix.series }}
 
             if [[ "${{ matrix.systems }}" =~ -arm- ]]; then
               BACKEND=google-arm
-              SPREAD=spread-arm
+            elif [[ "${{ matrix.group }}" =~ -crossbuild ]]; then
+              BACKEND=google-crossbuild
             fi
             
             RUN_TESTS=""
@@ -109,15 +169,17 @@ jobs:
                 RUN_TESTS="$FAILED_TESTS"
             else
                 for SYSTEM in ${{ matrix.systems }}; do
-                    RUN_TESTS="$RUN_TESTS $BACKEND:$SYSTEM:tests/..."
+                    for TESTS in ${{ matrix.tests }}; do
+                      RUN_TESTS="$RUN_TESTS $BACKEND:$SYSTEM:$TESTS"
+                    done
                 done
             fi
             # Run spread tests
             # "pipefail" ensures that a non-zero status from the spread is
             # propagated; and we use a subshell as this option could trigger
             # undesired changes elsewhere
-            echo "Running command: $SPREAD $RUN_TESTS"
-            (set -o pipefail; $SPREAD $RUN_TESTS | tee spread.log)
+            echo "Running command: spread $RUN_TESTS"
+            (set -o pipefail; spread $RUN_TESTS | tee spread.log)
 
       - name: Discard spread workers
         if: always()
@@ -127,7 +189,7 @@ jobs:
             spread -discard -reuse-pid="$(echo "$r" | grep -o -E '[0-9]+')";
           done
 
-      - name: analyze spread test results
+      - name: Analyze spread test results
         if: always()
         run: |
             if [ -f spread.log ]; then
@@ -158,7 +220,7 @@ jobs:
                 touch "$FAILED_TESTS_FILE"
             fi
 
-      - name: save spread test results to cache
+      - name: Save spread test results to cache
         if: always()
         uses: actions/cache/save@v4
         with:
